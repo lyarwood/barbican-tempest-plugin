@@ -27,7 +27,11 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 
 from oslo_log import log as logging
+from tempest.common import waiters
 from tempest import config
+from tempest import exceptions
+from tempest.lib.common.utils import data_utils
+from tempest.lib import exceptions as lib_exc
 
 from barbican_tempest_plugin import clients
 from barbican_tempest_plugin.tests.scenario import manager as mgr
@@ -182,3 +186,42 @@ class BarbicanScenarioTest(mgr.ScenarioTest):
         client.create_encryption_type(
             type_id, provider=provider, key_size=key_size, cipher=cipher,
             control_location=control_location)
+
+    def create_image_from_server(self, server_id, **kwargs):
+        """Wrapper utility that returns an image created from the server."""
+        name = kwargs.pop('name', data_utils.rand_name("-image"))
+        wait_until = kwargs.pop('wait_until', None)
+        wait_for_server = kwargs.pop('wait_for_server', True)
+
+        image = self.compute_images_client.create_image(server_id, name=name,
+                                                        **kwargs)
+        image_id = data_utils.parse_image_id(image.response['location'])
+
+        if wait_until is not None:
+            try:
+                waiters.wait_for_image_status(self.compute_images_client,
+                                              image_id, wait_until)
+            except lib_exc.NotFound:
+                if wait_until.upper() == 'ACTIVE':
+                    # If the image is not found after create_image returned
+                    # that means the snapshot failed in nova-compute and nova
+                    # deleted the image. There should be a compute fault
+                    # recorded with the server in that case, so get the server
+                    # and dump some details.
+                    server = (
+                        self.servers_client.show_server(server_id)['server'])
+                    if 'fault' in server:
+                        raise exceptions.SnapshotNotFoundException(
+                            server['fault'], image_id=image_id)
+                    else:
+                        raise exceptions.SnapshotNotFoundException(
+                            image_id=image_id)
+                else:
+                    raise
+            image = self.compute_images_client.show_image(image_id)['image']
+
+            if wait_until.upper() == 'ACTIVE':
+                if wait_for_server:
+                    waiters.wait_for_server_status(self.servers_client,
+                                                   server_id, 'ACTIVE')
+        return image
